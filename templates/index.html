@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fake Wispr Flow Dictation</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 24px;
+    background: #0f172a;
+    color: #e2e8f0;
+    user-select: none;
+  }
+  h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: .5px; }
+  #urlRow { display: flex; gap: 8px; width: min(90vw, 420px); }
+  #urlRow input {
+    flex: 1;
+    background: #1e293b;
+    border: 1px solid #334155;
+    color: #e2e8f0;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: .9rem;
+  }
+  #pttBtn {
+    width: 140px;
+    height: 140px;
+    border-radius: 50%;
+    border: 4px solid #334155;
+    background: #1e293b;
+    color: #e2e8f0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    touch-action: none;
+    transition: transform .1s, background .15s, box-shadow .15s;
+  }
+  #pttBtn.talking {
+    background: #dc2626;
+    border-color: #f87171;
+    transform: scale(.94);
+    box-shadow: 0 0 30px rgba(220, 38, 38, .5);
+  }
+  /* #pttBtn:disabled { opacity: .4; cursor: not-allowed; } */
+  #status { font-size: .95rem; color: #94a3b8; min-height: 1.4em; }
+  #status.live { color: #f87171; font-weight: 600; }
+  #status.ok   { color: #4ade80; font-weight: 600; }
+  #log {
+    width: min(90vw, 420px);
+    max-height: 140px;
+    overflow-y: auto;
+    font-size: .85rem;
+    color: #94a3b8;
+    text-align: center;
+    line-height: 1.6;
+  }
+  #log div { border-top: 1px solid #1e293b; padding: 3px 0; }
+  .hint { font-size: .8rem; color: #64748b; }
+  kbd { background: #1e293b; border-radius: 4px; padding: 1px 5px; }
+  .transcriptBox {
+    border-color: #000000;
+  }
+  .transcript {
+    width: min(90vw, 420px);
+    max-height: 140px;
+    overflow-y: auto;
+    font-size: .85rem;
+    color: #94a3b8;
+    text-align: left;
+    line-height: 1.6;
+  }
+  .thinking {
+    width: 12px;
+    height: 12px;
+    border: 4px solid #f3f3f3;
+    border-top: 4px solid #2196F3;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+    margin: 20px auto;
+  }
+  @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+  }
+</style>
+</head>
+<body>
+
+<h1>Fake Wispr Flow Dictation</h1>
+
+<button id="pttBtn" disabled>SPEAK</button>
+
+<div id="log"></div>
+<p class="hint">Hold down <kbd>Space</kbd> to talk.</p>
+
+<div id="transcriptBox" class="transcriptBox">
+  Transcript (working)
+  <div id="transcriptWorking" class="transcript"></div>
+  <div id="thinkingWorking" class="thinking" hidden></div>
+</div>
+
+<div class="transcriptBox">
+  Transcript (raw)
+  <div id="transcriptRaw" class="transcript"></div>
+  <div id="thinkingRaw" class="thinking" hidden></div>
+
+</div>
+
+
+
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script>
+
+(function () {
+  const urlInput = document.getElementById('serverUrl');
+  const connectBtn = document.getElementById('connectBtn');
+  const btn = document.getElementById('pttBtn');
+  const status = document.getElementById('status');
+  const log = document.getElementById('log');
+  const transcriptRaw = document.getElementById('transcriptRaw');
+  const transcriptWorking = document.getElementById('transcriptWorking');
+  const transcriptFinal = document.getElementById('transcriptFinal');
+  const thinkingRaw = document.getElementById('thinkingRaw');
+  const thinkingWorking = document.getElementById('thinkingWorking');
+
+  let wsRaw = null, connected = false;
+  let audioCtx, source, worklet, stream;
+  let isTalking = false, spaceHeld = false;
+
+  function setStatus(msg, cls) {
+    status.textContent = msg;
+    status.className = cls || '';
+  }
+  function addLog(msg) {
+    const d = document.createElement('div');
+    d.textContent = msg;
+    log.prepend(d);
+  }
+
+  wsRaw = new WebSocket(document.URL + "/audio")
+  wsClean = new WebSocket(document.URL + "/clean")
+
+  wsRaw.onmessage = e => {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'transcriptRaw') {
+        transcriptRaw.append(" " + msg.text);
+        transcriptWorking.append(" " + msg.text);
+        thinkingRaw.hidden = true;
+      } else if (msg.type === 'transcriptWorking') {
+        transcriptWorking.textContent = msg.text;
+      }
+      wsClean.send(JSON.stringify({
+        type: 'clean',
+        text: transcriptWorking.textContent
+      }));
+
+  }
+
+  wsClean.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    console.log(msg)
+    if (msg.type === 'transcriptWorking') {
+      transcriptWorking.textContent = msg.text;
+    }
+    thinkingWorking.hidden = true;
+  }
+
+  // ---------- Streaming (AudioWorklet → raw PCM16 → WebSocket) ----------
+  const workletCode = `
+    class PTTProcessor extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0];
+        if (ch && ch[0]) {
+          const f32 = ch[0];
+          const i16 = new Int16Array(f32.length);
+          for (let i = 0; i < f32.length; i++)
+            i16[i] = Math.max(-32768, Math.min(32767, f32[i] * 32767));
+          this.port.postMessage(i16.buffer, [i16.buffer]);
+        }
+        return true;
+      }
+    }
+    registerProcessor('ptt-processor', PTTProcessor);
+  `;
+
+  async function startTalking() {
+    if (isTalking) return;
+    isTalking = true;
+    btn.classList.add('talking');
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioCtx = new AudioContext();
+      await audioCtx.audioWorklet.addModule(
+        URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }))
+      );
+      source = audioCtx.createMediaStreamSource(stream);
+      worklet = new AudioWorkletNode(audioCtx, 'ptt-processor');
+      worklet.port.onmessage = e => {
+        if (wsRaw && wsRaw.readyState === WebSocket.OPEN) wsRaw.send(e.data);
+      };
+      source.connect(worklet);
+
+      // Tell the server the stream parameters (sampleRate, channels, bit depth)
+      wsRaw.send(JSON.stringify({
+        type: 'start',
+        sampleRate: audioCtx.sampleRate,
+        channels: 1,
+        bitDepth: 16
+      }));
+      // setStatus('● Talking — streaming…', 'live');
+    } catch (err) {
+      isTalking = false;
+      btn.classList.remove('talking');
+      // setStatus('Mic error: ' + err.message);
+    }
+  }
+
+  function stopTalking() {
+    if (!isTalking) return;
+    isTalking = false;
+    btn.classList.remove('talking');
+
+    try {
+      if (wsRaw && wsRaw.readyState === WebSocket.OPEN)
+        wsRaw.send(JSON.stringify({ type: 'stop' }));
+      worklet && worklet.disconnect();
+      stream && stream.getTracks().forEach(t => t.stop());
+      audioCtx && audioCtx.close();
+      thinkingRaw.hidden = false;
+      thinkingWorking.hidden = false;
+    } catch (e) {}
+
+    console.log(wsRaw)
+  }
+
+  // ---------- Controls ----------
+  btn.addEventListener('mousedown', startTalking);
+  btn.addEventListener('mouseup', stopTalking);
+
+  window.addEventListener('keydown', e => {
+    if (e.key === ' ' && !spaceHeld && !e.repeat && document.activeElement.tagName !== 'INPUT') {
+      spaceHeld = true;
+      e.preventDefault();
+      startTalking();
+    }
+  });
+  window.addEventListener('keyup', e => {
+    if (e.key === ' ' && spaceHeld) { spaceHeld = false; stopTalking(); }
+  });
+})();
+</script>
+
+</body>
+</html>
